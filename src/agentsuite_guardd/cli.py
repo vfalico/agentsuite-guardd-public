@@ -34,12 +34,22 @@ def main(argv=None):
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("descriptor")
     sub.add_parser("serve")
+    sub.add_parser("serve-enforcement")
+    sub.add_parser("serve-guest-enforcement")
     c = sub.add_parser("compile")
     c.add_argument("policy")
     c.add_argument("--digest", required=True)
     c.add_argument("--target", required=True)
     a = p.parse_args(argv)
     try:
+        if a.command == "serve-guest-enforcement":
+            from .guest_stream import serve_file
+            serve_file(a.config)
+            return 0
+        if a.command == "serve-enforcement":
+            from .neutral_service import serve_file
+            serve_file(a.config)
+            return 0
         if a.command == "compile":
             from .policy import compile_policy
 
