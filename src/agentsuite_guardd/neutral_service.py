@@ -23,8 +23,11 @@ import threading
 import time
 
 from .network_policy import compile_network
+from .policy import compile_policy, BackendPlan
+from .model import CAPABILITY
 from .target import validate_cgroup_fd, task_ids, read_events
 from .native_network import Native
+from .native_filesystem import FilesystemNative, HeldPaths
 from .namespace_policy import NamespacePolicy
 
 VERSION = "execution-enforcement/v1"
@@ -46,10 +49,14 @@ def exact(value, keys):
 
 def requirement(value):
     exact(value, {"format", "bytes", "digest", "capabilities"})
-    if value["format"] != "agentsuite.policy/v2":
-        raise ValueError("unsupported complete policy format")
     raw = base64.b64decode(value["bytes"], validate=True)
-    return compile_network(raw, value["digest"], value["capabilities"])
+    if value["format"] == "agentsuite.policy/v2":
+        return compile_network(raw, value["digest"], value["capabilities"])
+    if value["format"] == "agentsuite.policy/v1":
+        if value["capabilities"] != [CAPABILITY]:
+            raise ValueError("unsupported complete filesystem capabilities")
+        return compile_policy(raw, value["digest"], "held-native")
+    raise ValueError("unsupported complete policy format")
 
 
 def target_identity(fd):
@@ -101,14 +108,17 @@ def held_target(fds, target):
     actual = os.stat("/proc/" + str(pid) + "/ns/net")
     if (ns.st_dev, ns.st_ino) != (actual.st_dev, actual.st_ino) or ns.st_ino != target["netns"]:
         raise ValueError("network namespace changed")
+    return pid
 
 
 class Service:
-    def __init__(self, state, pins, native):
+    def __init__(self, state, pins, native, filesystem=None):
         self.state = Path(state)
         self.pins = Path(pins)
         self.pins.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.native = native
+        self.filesystem = filesystem
+        self.held_paths = {}
         self.namespace = NamespacePolicy()
         # A second process must not reconcile or activate against this store.
         # The lease outlives all request/reply connections and never deletes WAL.
@@ -129,6 +139,8 @@ class Service:
         self.lock = threading.RLock()
 
     def close(self):
+        for held in self.held_paths.values():
+            held.close()
         self.db.close()
         os.close(self.lease)
 
@@ -153,7 +165,9 @@ class Service:
             if fds or request["target"] is not None or request["operation"]:
                 raise ValueError("assess is advisory, without target or operation")
             try:
-                requirement(request["requirement"])
+                plan = requirement(request["requirement"])
+                if isinstance(plan, BackendPlan) and self.filesystem is None:
+                    raise ValueError("filesystem BPF object is not configured")
             except (ValueError, TypeError) as error:
                 return dict(supported=False, reason=str(error))
             return dict(supported=True)
@@ -163,6 +177,10 @@ class Service:
         if type(operation) is not str or not 1 <= len(operation) <= 128:
             raise ValueError("operation required")
         target = request["target"]
+        exact(request["requirement"], {"format", "bytes", "digest", "capabilities"})
+        filesystem = request["requirement"].get("format") == "agentsuite.policy/v1"
+        if filesystem and type(target) is dict and "kind" in target:
+            raise ValueError("filesystem enforcement requires a held-native target")
         if type(target) is dict and target.get("kind") == "network-interface/v1":
             return self.dispatch_interface(request, fds)
         subtree = type(target) is dict and target.get("kind") == "cgroup-subtree/v1"
@@ -172,6 +190,9 @@ class Service:
                 raise ValueError("positive incarnation generation required")
         else:
             exact(target, {"boot", "cgroup", "pid", "start", "netns", "generation"})
+        if filesystem and (type(target["generation"]) is not int or
+                           not 1 <= target["generation"] <= 0xffffffffffffffff):
+            raise ValueError("filesystem generation must be a positive uint64")
         association = dict(requirement=request["requirement"], target=target)
         blob = canonical(association)
         target_key = identity({k: target[k] for k in ["boot", "cgroup"]})
@@ -186,19 +207,55 @@ class Service:
                 elif len(fds) != 3:
                     raise ValueError("activation needs cgroup, pidfd and namespace handles")
                 plan = requirement(request["requirement"])
+                backend = self.filesystem if filesystem else self.native
+                if backend is None:
+                    raise ValueError("filesystem BPF object is not configured")
                 if not subtree:
-                    held_target(fds, target)
+                    pid = held_target(fds, target)
                 if row:
                     if row[2] != "ACTIVE":
                         raise ValueError("uncertain or retiring operation is cleanup-only")
-                    self.native.verify(row[4], fds[0], plan.endpoints)
+                    if filesystem:
+                        proof = json.loads(row[3])
+                        current = HeldPaths(pid, target["start"], plan.deny_write_paths)
+                        try:
+                            spec = dict(current.spec, generation=target["generation"])
+                            if proof.get("filesystem") != spec:
+                                raise ValueError("filesystem identity changed on retry")
+                            if backend.verify(row[4], fds[0], spec) != proof:
+                                raise ValueError("filesystem kernel ownership changed")
+                            current.check()
+                            held_target(fds, target)
+                            if operation not in self.held_paths:
+                                self.held_paths[operation] = current
+                        finally:
+                            if self.held_paths.get(operation) is not current:
+                                current.close()
+                    else:
+                        self.native.verify(row[4], fds[0], plan.endpoints)
                     return dict(self.bound(operation, association), active=True)
                 path = self.pins / hashlib.sha256(operation.encode()).hexdigest()
-                with self.db:
-                    self.db.execute("INSERT INTO bindings VALUES(?,?,?,?,?,?)", (operation, blob, target_key, "ACTIVATING", None, str(path)))
-                proof = self.native.install(path, fds[0], plan.endpoints)
-                if self.native.verify(path, fds[0], plan.endpoints) != proof:
+                held = HeldPaths(pid, target["start"], plan.deny_write_paths) if filesystem else None
+                intent = dict(filesystem=dict(held.spec, generation=target["generation"])) if held else None
+                try:
+                    with self.db:
+                        self.db.execute("INSERT INTO bindings VALUES(?,?,?,?,?,?)", (operation, blob, target_key, "ACTIVATING", canonical(intent) if intent else None, str(path)))
+                except BaseException:
+                    if held:
+                        held.close()
+                    raise
+                if held:
+                    # Retain identities even if installation/readback fails.
+                    self.held_paths[operation] = held
+                payload = intent["filesystem"] if filesystem else plan.endpoints
+                proof = backend.install(path, fds[0], payload)
+                # Persist kernel ownership before the independent verification:
+                # a later failure is still cleanup-only, with exact IDs retained.
+                self.update(operation, "ACTIVATING", proof)
+                if backend.verify(path, fds[0], payload) != proof:
                     raise ValueError("independent native readback changed")
+                if held:
+                    held.check()
                 if not subtree:
                     held_target(fds, target)
                 self.update(operation, "ACTIVE", proof)
@@ -219,7 +276,34 @@ class Service:
                 if row[2] != "ACTIVE":
                     return dict(self.bound(operation, association), active=False, phase=row[2])
                 plan = requirement(request["requirement"])
-                self.native.verify(row[4], fds[0], plan.endpoints)
+                if filesystem:
+                    if self.filesystem is None:
+                        raise ValueError("filesystem BPF object is not configured")
+                    proof = json.loads(row[3])
+                    spec = proof["filesystem"]
+                    # Receiver-local PID/start was bound from a live pidfd at
+                    # activation, never from the caller's numeric PID.
+                    if spec["pid"] not in task_ids(fds[0]):
+                        raise ValueError("filesystem root process no longer belongs to target")
+                    current = HeldPaths(spec["pid"], spec["start"], plan.deny_write_paths)
+                    try:
+                        if dict(current.spec, generation=target["generation"]) != spec:
+                            raise ValueError("filesystem identities changed since activation")
+                        observed = self.filesystem.verify(row[4], fds[0], spec)
+                        if observed != proof:
+                            raise ValueError("filesystem kernel ownership changed")
+                        current.check()
+                        if spec["pid"] not in task_ids(fds[0]):
+                            raise ValueError("filesystem root process left target during readback")
+                        if operation not in self.held_paths:
+                            self.held_paths[operation] = current
+                    finally:
+                        if self.held_paths.get(operation) is not current:
+                            current.close()
+                    return dict(self.bound(operation, association), active=True,
+                                phase=row[2], readback=observed)
+                else:
+                    self.native.verify(row[4], fds[0], plan.endpoints)
                 return dict(self.bound(operation, association), active=True, phase=row[2])
             # Stable empty must precede *any* removal, including uncertain installs.
             for _ in range(3):
@@ -377,20 +461,40 @@ class Service:
         if path.parent != self.pins:
             raise ValueError("pin owner changed")
         proof = json.loads(row[3]) if row[3] else None
-        expected = {"endpoints", "targets"} | {n + suffix for n in self.native.PROGRAMS for suffix in ["-prog", "-link"]}
+        filesystem = json.loads(row[0])["requirement"]["format"] == "agentsuite.policy/v1"
+        backend = self.filesystem if filesystem else self.native
+        if backend is None:
+            raise ValueError("filesystem BPF object is required for cleanup")
+        maps = set(backend.MAPS) if hasattr(backend, "MAPS") else {"endpoints", "targets"}
+        expected = maps | {n + suffix for n in backend.PROGRAMS for suffix in ["-prog", "-link"]}
+        operation = self.db.execute("SELECT operation FROM bindings WHERE pins=?", (str(path),)).fetchone()
         if path.exists():
             if not {p.name for p in path.iterdir()} <= expected:
                 raise ValueError("foreign pin blocks retirement")
-            if proof:
+            if proof and "maps" in proof:
                 for kind, objects in [("map", proof["maps"]), ("link", proof["links"]), ("prog", proof["programs"])]:
                     for name, obj in objects.items():
                         pin = path / (name if kind == "map" else name + "-" + kind)
-                        if pin.exists() and self.native.info(kind, pin)["id"] != obj["id"]:
+                        if pin.exists() and backend.info(kind, pin)["id"] != obj["id"]:
                             raise ValueError("pin identity changed")
+            if filesystem and (not proof or "maps" not in proof):
+                # An install may have failed before complete readback. Only
+                # after EMPTY_CONFIRMED, journal the exact partial inventory
+                # before unlinking so crash recovery still proves ID absence.
+                proof = dict(proof or {}, maps={}, programs={}, links={})
+                for pin in path.iterdir():
+                    if pin.name.endswith("-prog"):
+                        kind, group, name = "prog", "programs", pin.name[:-5]
+                    elif pin.name.endswith("-link"):
+                        kind, group, name = "link", "links", pin.name[:-5]
+                    else:
+                        kind, group, name = "map", "maps", pin.name
+                    proof[group][name] = backend.info(kind, pin)
+                self.update(operation[0], "EMPTY_CONFIRMED", proof)
             for pin in sorted(path.iterdir(), key=lambda p: 0 if p.name.endswith("-link") else 1):
                 pin.unlink()
             path.rmdir()
-        if proof:
+        if proof and "maps" in proof:
             # Kernel object release can be RCU-delayed; bounded retries do not
             # weaken the independent exact-ID absence requirement.
             deadline = time.monotonic() + 5
@@ -398,13 +502,15 @@ class Service:
                 live = []
                 for kind, objects in [("map", proof["maps"]), ("link", proof["links"]), ("prog", proof["programs"])]:
                     for obj in objects.values():
-                        if self.native.object_exists(kind, obj["id"]):
+                        if backend.object_exists(kind, obj["id"]):
                             live.append((kind, obj["id"]))
                 if not live:
                     break
                 if time.monotonic() >= deadline:
                     raise ValueError("native object residue remains: " + repr(live))
                 time.sleep(0.05)
+        if operation and operation[0] in self.held_paths:
+            self.held_paths.pop(operation[0]).close()
 
 
 
@@ -441,8 +547,9 @@ def bind_owned_socket(sock, address):
 
 def serve(config):
     """Root-only caller authentication and descriptor transfer; one normal daemon."""
-    exact(config, {"socket", "state", "pins", "object"})
-    service = Service(config["state"], config["pins"], Native(config["object"]))
+    validate_config(config)
+    filesystem = FilesystemNative(config["filesystemObject"]) if "filesystemObject" in config else None
+    service = Service(config["state"], config["pins"], Native(config["object"]), filesystem)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     try:
         bound = bind_owned_socket(sock, config["socket"])
@@ -513,8 +620,15 @@ def serve_file(path):
         if len(raw) > 16384:
             raise ValueError("configuration too large")
     config = json.loads(raw)
-    exact(config, {"socket", "state", "pins", "object"})
+    validate_config(config)
+    serve(config)
+
+
+def validate_config(config):
+    if type(config) is not dict or set(config) not in (
+            {"socket", "state", "pins", "object"},
+            {"socket", "state", "pins", "object", "filesystemObject"}):
+        raise ValueError("exact neutral configuration fields required")
     for key, value in config.items():
         if type(value) is not str or not Path(value).is_absolute():
             raise ValueError("absolute trusted configuration paths required: " + key)
-    serve(config)

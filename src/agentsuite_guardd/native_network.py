@@ -16,6 +16,8 @@ from .target import validate_cgroup_fd
 
 class Native:
     PROGRAMS={'connect4':('cgroup',10),'egress':('cgroup',1),'socket_create':('lsm',None),'file_receive':('lsm',None),'socket_accept':('lsm',None),'socket_bind':('lsm',None),'socket_connect':('lsm',None),'socket_sendmsg':('lsm',None)}
+    MAPS = {'endpoints': ('hash', 8, 4, 4096), 'targets': ('hash', 8, 4, 1)}
+    HOOKS = {}
     def __init__(self,obj):
         self.path=str(Path(obj).resolve()); self.lib=C.CDLL('libbpf.so.1',use_errno=True)
         signatures={
@@ -36,6 +38,8 @@ class Native:
         for name,(restype,args) in signatures.items():
             fn=getattr(self.lib,name);fn.restype=restype;fn.argtypes=args
     def pointer(self,p):
+        if not p:
+            raise OSError(errno.ENOENT, "required native BPF object/program is absent")
         e=self.lib.libbpf_get_error(p)
         if e: raise OSError(-e,os.strerror(-e))
         return p
@@ -78,21 +82,27 @@ class Native:
     @staticmethod
     def dump(path):
         return json.loads(subprocess.check_output(['bpftool','-j','map','dump','pinned',str(path)],timeout=5))
+    def entries(self, cgroup, endpoints):
+        cg = validate_cgroup_fd(cgroup)
+        return {
+            'endpoints': {ipaddress.IPv4Address(a).packed + struct.pack('=I', p): struct.pack('=I', 1) for a, p in endpoints},
+            'targets': {struct.pack('=Q', cg.cgroup_id): struct.pack('=I', 1)},
+        }
+
     def install(self,directory,cgroup,endpoints):
         directory=Path(directory); directory.mkdir(mode=0o700)
         obj=self.pointer(self.lib.bpf_object__open_file(self.path.encode(),None));links=[]
         try:
             self.checked(self.lib.bpf_object__load(obj))
-            maps={name:self.checked(self.lib.bpf_object__find_map_fd_by_name(obj,name.encode())) for name in ['endpoints','targets']}
+            maps={name:self.checked(self.lib.bpf_object__find_map_fd_by_name(obj,name.encode())) for name in self.MAPS}
             # Pin maps before mutation; uncertain failure always has a journaled owner.
             for name,fd in maps.items():self.checked(self.lib.bpf_obj_pin(fd,str(directory/name).encode()))
-            cg=validate_cgroup_fd(cgroup)
-            for address,port in endpoints:
-                key=C.create_string_buffer(ipaddress.IPv4Address(address).packed+struct.pack('=I',port));value=C.c_uint32(1)
-                self.checked(self.lib.bpf_map_update_elem(maps['endpoints'],key,C.byref(value),0))
-            key=C.c_uint64(cg.cgroup_id);value=C.c_uint32(1)
-            self.checked(self.lib.bpf_map_update_elem(maps['targets'],C.byref(key),C.byref(value),0))
-            for fd in maps.values():self.checked(self.lib.bpf_map_freeze(fd))
+            for name, entries in self.entries(cgroup, endpoints).items():
+                for key, value in entries.items():
+                    self.checked(self.lib.bpf_map_update_elem(maps[name],C.create_string_buffer(key),C.create_string_buffer(value),0))
+            for name, fd in maps.items():
+                if self.MAPS[name][0] != 'ringbuf':
+                    self.checked(self.lib.bpf_map_freeze(fd))
             for name,(kind,_) in self.PROGRAMS.items():
                 program=self.pointer(self.lib.bpf_object__find_program_by_name(obj,name.encode()))
                 self.checked(self.lib.bpf_obj_pin(self.lib.bpf_program__fd(program),str(directory/(name+'-prog')).encode()))
@@ -105,27 +115,26 @@ class Native:
             self.lib.bpf_object__close(obj)
     def verify(self,directory,cgroup,endpoints):
         directory=Path(directory);cg=validate_cgroup_fd(cgroup);proof={'maps':{},'programs':{},'links':{}}
-        expected_names={'endpoints','targets'}|{n+s for n in self.PROGRAMS for s in ['-prog','-link']}
+        expected_names=set(self.MAPS)|{n+s for n in self.PROGRAMS for s in ['-prog','-link']}
         if {p.name for p in directory.iterdir()}!=expected_names:raise ValueError('network pinned inventory mismatch')
-        for name,size,count in [('endpoints',8,4096),('targets',8,1)]:
+        for name,(kind,size,value_size,count) in self.MAPS.items():
             path=directory/name
             fd=self.checked(self.lib.bpf_obj_get(str(path).encode()));os.close(fd)
             m=self.info('map',path)
-            if m['type']!='hash' or m['bytes_key']!=size or m['bytes_value']!=4 or m['max_entries']!=count or m.get('flags',0)!=0 or not m.get('frozen',0):raise ValueError('network map ABI mismatch')
+            if m['type']!=kind or m['bytes_key']!=size or m['bytes_value']!=value_size or m['max_entries']!=count or m.get('flags',0)!=0 or (kind != 'ringbuf' and not m.get('frozen',0)):raise ValueError('native map ABI mismatch')
             proof['maps'][name]=m
         def byte_array(value):
             if isinstance(value,dict):value=value.get('bytes',value)
             if not isinstance(value,list):raise ValueError('unexpected bpftool map byte encoding')
             return bytes(int(v,16) if isinstance(v,str) else v for v in value)
-        actual={byte_array(e['key']):byte_array(e['value']) for e in self.dump(directory/'endpoints')}
-        expected={ipaddress.IPv4Address(a).packed+struct.pack('=I',p):struct.pack('=I',1) for a,p in endpoints}
-        if actual!=expected:raise ValueError('complete endpoint map readback mismatch')
-        actual={byte_array(e['key']):byte_array(e['value']) for e in self.dump(directory/'targets')}
-        if actual!={struct.pack('=Q',cg.cgroup_id):struct.pack('=I',1)}:raise ValueError('target map readback mismatch')
+        for name, expected in self.entries(cgroup, endpoints).items():
+            rows = self.dump(directory/name)
+            actual={byte_array(e['key']):byte_array(e['value']) for e in rows}
+            if len(rows) != len(actual) or actual!=expected:raise ValueError('complete native map readback mismatch: '+name)
         owned={m['id'] for m in proof['maps'].values()}
         for name,(kind,attach) in self.PROGRAMS.items():
             p=self.info('prog',directory/(name+'-prog'));link=self.info('link',directory/(name+'-link'))
-            if p['name']!=name or not set(p.get('map_ids',[]))<=owned or link['prog_id']!=p['id']:raise ValueError('network program/link identity mismatch')
+            if p['name']!=name[:15] or not set(p.get('map_ids',[]))<=owned or link['prog_id']!=p['id']:raise ValueError('network program/link identity mismatch')
             if kind=='cgroup':
                 if link['type']!='cgroup' or link['cgroup_id']!=cg.cgroup_id or link['attach_type'] not in [attach, {10:'cgroup_inet4_connect',1:'cgroup_inet_egress'}[attach]]:raise ValueError('network cgroup attachment mismatch')
             else:
@@ -143,7 +152,8 @@ class Native:
                 btf=json.loads(subprocess.check_output(args,timeout=10))
                 types=btf.get('types',btf) if isinstance(btf,dict) else btf
                 entry=next((t for t in types if t['id']==btf_id),None)
-                if entry is None or entry.get('name') not in ['bpf_lsm_'+name,'security_'+name]:raise ValueError('network LSM hook identity mismatch')
+                hook = self.HOOKS.get(name, name)
+                if entry is None or entry.get('name') not in ['bpf_lsm_'+hook,'security_'+hook]:raise ValueError('network LSM hook identity mismatch')
             proof['programs'][name]=p;proof['links'][name]=link
         if len({v['id'] for v in proof['links'].values()})!=len(self.PROGRAMS):raise ValueError('duplicate network links')
         return proof

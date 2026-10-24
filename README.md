@@ -34,7 +34,7 @@ PYTHONPATH=src python3 -m agentsuite_guardd.cli --config /tmp/guardd-smoke/confi
 
 Runtime roots are `/etc/agentsuite-guardd`, `/run/agentsuite-guardd`, and `/var/lib/agentsuite-guardd`. No remote service or registry is required to build this source handoff.
 
-## Runtime-neutral network service (experimental)
+## Runtime-neutral enforcement service (experimental)
 
 `agentsuite-guardd --config /absolute/private/network.json serve-enforcement`
 runs the `execution-enforcement/v1` Unix `SOCK_SEQPACKET` service implemented
@@ -43,11 +43,54 @@ runtime patchsets. The legacy `serve` command, signing-seed configuration,
 Go adapter and filesystem systemd units above are a separate compatibility
 lane; they do not start or configure the neutral service.
 
-The neutral service configuration has exactly these four absolute paths:
+The neutral service configuration requires these four absolute paths:
 
 ```json
 {"socket":"/run/task-enforcer/provider.sock","state":"/var/lib/task-enforcer/provider.db","pins":"/sys/fs/bpf/task-enforcer","object":"/opt/task-enforcer/network.bpf.o"}
 ```
+
+An optional fifth absolute path, `"filesystemObject"`, enables standalone
+`agentsuite.policy/v1` / `filesystem/deny-write/v1` requirements through the
+same held-native boundary. Build `gadget/program.bpf.c` into that object using
+the same BTF/header procedure below; do not point it at the network object.
+The existing `"object"` network configuration and network behavior are unchanged.
+Without `"filesystemObject"`, filesystem assessment and activation refuse.
+This is not a combined filesystem/network policy or a network enforcement
+claim for filesystem-only workloads.
+
+Filesystem activation requires the existing three transferred descriptors:
+exact cgroupfd, live pidfd, and netnsfd. The process must still be held by the
+runtime. Guardd resolves the **pidfd's receiver-local process**, validates the
+existing start/netns/cgroup identity, opens that process's `/proc/.../root`,
+and traverses policy paths relative to that held root. It never substitutes a
+same-named host path or uses the caller's numeric PID to locate the root.
+All policy components and descendants must exist, contain only ordinary
+directories/files, and have no symlinks. Traversal is limited to 8,192
+protected pathname identities, 128 components, and 4,096 pathname bytes;
+the serialized snapshot is capped at 64 KiB for bounded seqpacket readback.
+Resource exhaustion also refuses. Lower process FD limits can impose a
+smaller practical bound. Protected FDs remain held until retirement or daemon
+exit. The durable snapshot records receiver-local PID/start, root/mount
+namespace identity, protected dev/inode/mode/ctime identities and generation.
+Restart/lookup must recover the identical snapshot, not rebase a policy onto
+new inodes. The root process must remain alive in the bound cgroup for lookup.
+
+Each operation loads a private filesystem object: exactly three maps and all
+15 BPF-LSM programs/links. Both policy maps are frozen and completely dumped
+for exact readback; the kernel-produced denial ring buffer is not freezable.
+No other cgroup appears in the target map. Failures leave the durable operation
+cleanup-only with restrictions and identity FDs retained. Only the existing
+runtime-stopped/stable-empty retirement fence permits removal, including
+uncertain partial installs. Object-ID absence is independently checked after
+unpinning. No global legacy filesystem adapter is invoked.
+
+Use `lookup` with the exact original operation/requirement/target and one
+cgroup descriptor for independent live readback while the runtime challenge
+is held. An active filesystem reply includes `readback` containing verified
+map/program/link IDs, attachment metadata and the bound filesystem snapshot.
+It is not an SQLite-only status query. See [the neutral protocol and observer
+example](docs/PROTOCOL.md#neutral-held-native-filesystem-boundary) and
+[the security scope](docs/SECURITY.md#neutral-held-native-filesystem-scope).
 
 Prepare dedicated root-owned directories with no untrusted write access.
 Configuration must be a root-owned regular file with no group/other write
