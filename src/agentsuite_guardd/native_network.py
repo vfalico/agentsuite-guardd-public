@@ -12,7 +12,7 @@ import os
 import struct
 import subprocess
 from pathlib import Path
-from .target import validate_cgroup_fd
+from .target import validate_cgroup_fd, cgroup_removed, TargetNotLive
 
 class Native:
     PROGRAMS={'connect4':('cgroup',10),'egress':('cgroup',1),'socket_create':('lsm',None),'file_receive':('lsm',None),'socket_accept':('lsm',None),'socket_bind':('lsm',None),'socket_connect':('lsm',None),'socket_sendmsg':('lsm',None)}
@@ -132,11 +132,21 @@ class Native:
             actual={byte_array(e['key']):byte_array(e['value']) for e in rows}
             if len(rows) != len(actual) or actual!=expected:raise ValueError('complete native map readback mismatch: '+name)
         owned={m['id'] for m in proof['maps'].values()}
+        # BTF is immutable while referenced by the pinned programs. Parse each
+        # object once within this readback, never reuse it across verify calls.
+        btf_names = {}
         for name,(kind,attach) in self.PROGRAMS.items():
             p=self.info('prog',directory/(name+'-prog'));link=self.info('link',directory/(name+'-link'))
-            if p['name']!=name[:15] or not set(p.get('map_ids',[]))<=owned or link['prog_id']!=p['id']:raise ValueError('network program/link identity mismatch')
+            # bpftool can report the full BTF function name instead of the
+            # kernel's 15-byte object name. Neither spelling weakens the
+            # independent program/link, private-map and hook-BTF checks below.
+            if p['name'] not in {name, name[:15]} or not set(p.get('map_ids',[]))<=owned or link['prog_id']!=p['id']:raise ValueError('network program/link identity mismatch')
             if kind=='cgroup':
-                if link['type']!='cgroup' or link['cgroup_id']!=cg.cgroup_id or link['attach_type'] not in [attach, {10:'cgroup_inet4_connect',1:'cgroup_inet_egress'}[attach]]:raise ValueError('network cgroup attachment mismatch')
+                if link['type']!='cgroup' or link['attach_type'] not in [attach, {10:'cgroup_inet4_connect',1:'cgroup_inet_egress',14:'cgroup_udp4_sendmsg'}[attach]]:raise ValueError('network cgroup attachment mismatch')
+                if link['cgroup_id'] != cg.cgroup_id:
+                    if type(link['cgroup_id']) is int and link['cgroup_id'] == 0 and cgroup_removed(cgroup):
+                        raise TargetNotLive('network cgroup target was removed during readback')
+                    raise ValueError('network cgroup attachment mismatch')
             else:
                 if link['type']!='tracing' or p['type']!='lsm':raise ValueError('network LSM attachment mismatch')
                 # The loaded CO-RE program's attach BTF identity must name the exact LSM hook.
@@ -146,14 +156,16 @@ class Native:
                     self.checked(self.lib.bpf_obj_get_info_by_fd(fd,buf,C.byref(size)))
                     btf_obj,btf_id=struct.unpack_from('=II',buf.raw,220)
                 finally: os.close(fd)
-                if not btf_obj:
-                    args=['bpftool','-j','btf','dump','file','/sys/kernel/btf/vmlinux','format','raw']
-                else: args=['bpftool','-j','btf','dump','id',str(btf_obj),'format','raw']
-                btf=json.loads(subprocess.check_output(args,timeout=10))
-                types=btf.get('types',btf) if isinstance(btf,dict) else btf
-                entry=next((t for t in types if t['id']==btf_id),None)
+                if btf_obj not in btf_names:
+                    if not btf_obj:
+                        args=['bpftool','-j','btf','dump','file','/sys/kernel/btf/vmlinux','format','raw']
+                    else: args=['bpftool','-j','btf','dump','id',str(btf_obj),'format','raw']
+                    btf=json.loads(subprocess.check_output(args,timeout=10))
+                    types=btf.get('types',btf) if isinstance(btf,dict) else btf
+                    btf_names[btf_obj] = {t['id']: t.get('name') for t in types}
+                    del btf, types
                 hook = self.HOOKS.get(name, name)
-                if entry is None or entry.get('name') not in ['bpf_lsm_'+hook,'security_'+hook]:raise ValueError('network LSM hook identity mismatch')
+                if btf_names[btf_obj].get(btf_id) not in ['bpf_lsm_'+hook,'security_'+hook]:raise ValueError('network LSM hook identity mismatch')
             proof['programs'][name]=p;proof['links'][name]=link
         if len({v['id'] for v in proof['links'].values()})!=len(self.PROGRAMS):raise ValueError('duplicate network links')
         return proof

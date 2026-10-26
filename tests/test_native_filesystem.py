@@ -72,21 +72,39 @@ def test_non_normal_protected_paths_refuse(path):
         HeldPaths(os.getpid(), start(), [path])
 
 
-@pytest.mark.parametrize("where", ["root", "intermediate", "descendant"])
-def test_symlinks_never_followed(tmp_path, where):
+@pytest.mark.parametrize("where", ["root", "intermediate"])
+def test_policy_root_symlinks_refuse(tmp_path, where):
     real = tmp_path / "real"
     real.mkdir()
     (real / "canary").write_text("original")
     link = tmp_path / "link"
     link.symlink_to(real, target_is_directory=True)
-    if where == "descendant":
-        protected = real
-        (real / "escape").symlink_to(tmp_path)
-    else:
-        protected = link if where == "root" else link / "canary"
+    protected = link if where == "root" else link / "canary"
     with pytest.raises(ValueError, match="symlinks|only regular"):
         HeldPaths(os.getpid(), start(), [str(protected)])
     assert (real / "canary").read_text() == "original"
+
+
+def test_descendant_symlinks_are_held_without_following_destinations(tmp_path):
+    protected = tmp_path / "repository"
+    protected.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_text("outside")
+    links = [protected / name for name in ("outside", "broken", "loop")]
+    links[0].symlink_to(outside)
+    links[1].symlink_to("does-not-exist")
+    links[2].symlink_to(".")
+    with HeldPaths(os.getpid(), start(), [str(protected)]) as held:
+        records = {record[0]: record[1:] for record in held.spec["entries"]}
+        assert set(records) == {str(protected), *(str(link) for link in links)}
+        for link in links:
+            assert records[str(link)][1] == link.lstat().st_ino
+        held.check()
+        links[0].unlink()
+        links[0].symlink_to("different")
+        with pytest.raises(ValueError, match="identities changed"):
+            held.check()
+    assert outside.read_text() == "outside"
 
 
 def test_missing_path_and_special_file_refuse(tmp_path):
@@ -207,12 +225,49 @@ def readback(tmp_path):
         yield native, tmp_path, spec, info, dumps, btf_types
 
 
-def test_full_verifier_accepts_exact_synthetic_inventory(readback):
+@pytest.mark.parametrize("full_btf_names", [False, True])
+def test_full_verifier_accepts_exact_synthetic_inventory(readback, full_btf_names):
     native, directory, spec, info, dumps, btf = readback
+    if full_btf_names:
+        for name in native.PROGRAMS:
+            info[("prog", name + "-prog")]["name"] = name
     proof = native.verify(directory, 99, spec)
     assert proof["filesystem"] == spec
     assert len(proof["maps"]) == 3
     assert len(proof["programs"]) == len(proof["links"]) == 15
+
+
+def test_btf_schema_reused_only_within_one_verification(readback):
+    native, directory, spec, info, dumps, btf = readback
+    import agentsuite_guardd.native_network as network
+    with patch.object(network.subprocess, "check_output", wraps=network.subprocess.check_output) as schema:
+        native.verify(directory, 99, spec)
+        assert schema.call_count == 1
+        btf[0]["name"] = "bpf_lsm_wrong"
+        with pytest.raises(ValueError, match="hook identity mismatch"):
+            native.verify(directory, 99, spec)
+        assert schema.call_count == 2
+
+
+def test_distinct_btf_objects_are_read_independently(readback):
+    native, directory, spec, info, dumps, btf = readback
+    import agentsuite_guardd.native_network as network
+    original = native.lib.bpf_obj_get_info_by_fd
+    calls = 0
+
+    def metadata(fd, buffer, size):
+        nonlocal calls
+        result = original(fd, buffer, size)
+        calls += 1
+        if calls == 1:
+            C.memmove(C.addressof(buffer) + 220, struct.pack("=I", 9), 4)
+        return result
+
+    native.lib.bpf_obj_get_info_by_fd = metadata
+    with patch.object(network.subprocess, "check_output", wraps=network.subprocess.check_output) as schema:
+        native.verify(directory, 99, spec)
+        selectors = [call.args[0][5] for call in schema.call_args_list]
+        assert sorted(selectors) == ["/sys/kernel/btf/vmlinux", "9"]
 
 
 @pytest.mark.parametrize("mutation", [

@@ -42,16 +42,32 @@ struct {
     __uint(max_entries, 1 << 20);
 } filesystem_denials SEC(".maps");
 
-static __always_inline int deny_inode(struct inode *inode, __u32 operation)
+static __always_inline __u64 governed_generation(void)
 {
     struct target_key target = { .cgroup_id = bpf_get_current_cgroup_id() };
     __u64 *generation = bpf_map_lookup_elem(&guarded_targets, &target);
+    if (generation)
+        return *generation;
+    for (__u32 level = 0; level < 64; level++) {
+        target.cgroup_id = bpf_get_current_ancestor_cgroup_id(level);
+        if (!target.cgroup_id)
+            continue;
+        generation = bpf_map_lookup_elem(&guarded_targets, &target);
+        if (generation)
+            return *generation;
+    }
+    return 0;
+}
+
+static __always_inline int deny_inode(struct inode *inode, __u32 operation)
+{
+    __u64 generation = governed_generation();
     struct path_key key = {};
     struct path_policy *policy;
     struct denial_event *event;
     if (!generation || !inode)
         return 0;
-    key.generation = *generation;
+    key.generation = generation;
     key.device = BPF_CORE_READ(inode, i_sb, s_dev);
     key.inode = BPF_CORE_READ(inode, i_ino);
     policy = bpf_map_lookup_elem(&guarded_paths, &key);
@@ -59,7 +75,7 @@ static __always_inline int deny_inode(struct inode *inode, __u32 operation)
         return 0;
     event = bpf_ringbuf_reserve(&filesystem_denials, sizeof(*event), 0);
     if (event) {
-        event->cgroup_id = target.cgroup_id;
+        event->cgroup_id = bpf_get_current_cgroup_id();
         event->generation = key.generation;
         event->device = key.device;
         event->inode = key.inode;

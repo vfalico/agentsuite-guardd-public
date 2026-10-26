@@ -4,8 +4,17 @@ from __future__ import annotations
 import ctypes
 import os
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 CGROUP2_SUPER_MAGIC = 0x63677270
+
+
+class TargetNotLive(ValueError):
+    """The held process or cgroup is no longer observable in its original target."""
+
+
+def boot_id() -> str:
+    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
 
 
 @dataclass(frozen=True)
@@ -49,7 +58,7 @@ def _filesystem_magic(fd: int) -> int:
     return int(buffer[0])
 
 
-def validate_cgroup_fd(fd: int) -> CgroupIdentity:
+def validate_cgroup_fd(fd: int, *, allow_deleted: bool = False) -> CgroupIdentity:
     """Duplicate then identify a directory FD; reject non-cgroup2/zero identity."""
     if fd < 0:
         raise ValueError("missing cgroup fd")
@@ -67,11 +76,17 @@ def validate_cgroup_fd(fd: int) -> CgroupIdentity:
         # cgroup as a " (deleted)" suffix. cgroupfs does not reliably drop
         # st_nlink, so reject using this kernel-owned FD link, not a path
         # supplied by the caller.
-        if os.readlink(f"/proc/self/fd/{owned}").endswith(" (deleted)"):
-            raise ValueError("cgroup fd refers to an unlinked cgroup")
+        if not allow_deleted and os.readlink(f"/proc/self/fd/{owned}").endswith(" (deleted)"):
+            raise TargetNotLive("cgroup fd refers to an unlinked cgroup")
         return CgroupIdentity(metadata.st_dev, metadata.st_ino, mount_id, metadata.st_ino)
     finally:
         os.close(owned)
+
+
+def cgroup_removed(fd: int) -> bool:
+    """A removed cgroup cannot contain tasks or children, or be repopulated."""
+    validate_cgroup_fd(fd, allow_deleted=True)
+    return os.readlink(f"/proc/self/fd/{fd}").endswith(" (deleted)")
 
 
 def read_events(fd: int) -> dict[str, int]:

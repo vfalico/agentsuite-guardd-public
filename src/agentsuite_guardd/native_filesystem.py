@@ -12,7 +12,7 @@ from .target import validate_cgroup_fd
 
 MAX_IDENTITIES = 8192
 MAX_DEPTH = 128
-MAX_SNAPSHOT_BYTES = 65536
+MAX_SNAPSHOT_BYTES = 512 * 1024
 OPERATION_MASK = sum(1 << (n + 1) for n in range(len(OPERATIONS)))
 
 
@@ -41,7 +41,8 @@ class HeldPaths:
     The caller must authenticate ``pid`` using the transferred pidfd first.
     Every inode remains open through installation/readback. The durable
     receiver-local PID/start/root/mount identity permits fail-closed recovery,
-    not arbitrary caller PID selection.
+    not arbitrary caller PID selection. Descendant symlinks are protected
+    objects; their destinations are never followed or added implicitly.
     """
 
     def __init__(self, pid, start, paths):
@@ -103,8 +104,8 @@ class HeldPaths:
         if len(self.records) >= MAX_IDENTITIES or depth > MAX_DEPTH:
             raise ValueError("protected tree exceeds bounded traversal")
         observed = path_identity(fd)
-        if stat.S_IFMT(observed[2]) not in {stat.S_IFREG, stat.S_IFDIR}:
-            raise ValueError("protected tree must contain only regular files and directories")
+        if stat.S_IFMT(observed[2]) not in {stat.S_IFREG, stat.S_IFDIR, stat.S_IFLNK}:
+            raise ValueError("protected tree must contain only regular files, directories and symlinks")
         self.records[path] = observed
         if stat.S_IFMT(observed[2]) == stat.S_IFDIR:
             listing = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=fd)
