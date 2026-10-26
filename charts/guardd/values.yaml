@@ -1,0 +1,17 @@
+enabled: false
+installationName: ""
+existingInstallationUID: ""
+
+# Both installer jobs and providers use the same locally qualified artifact.
+image: ""
+imagePullPolicy: IfNotPresent
+imagePullSecrets: []
+
+criSocketDirectory: /run/containerd
+criSocketName: containerd.sock
+stateDirectory: /var/lib/guardd
+controllerIdentity: spiffe://orka.ai/controller
+controllerMountDirectory: /var/run/orka/enforcement
+nodeSelector:
+  kubernetes.io/os: linux
+  kubernetes.io/arch: amd64

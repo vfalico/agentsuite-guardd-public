@@ -1,0 +1,6 @@
+apiVersion: v2
+name: guardd
+description: Optional, retained whole-container enforcement provider installation
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

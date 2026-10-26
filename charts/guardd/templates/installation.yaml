@@ -1,0 +1,179 @@
+{{- $name := include "guardd.installationName" . -}}
+{{- $retained := lookup "v1" "ConfigMap" .Release.Namespace (printf "%s-installation" $name) -}}
+{{- if or .Values.enabled $retained }}
+{{- if not (regexMatch "^[A-Za-z0-9._:/-]+@sha256:[a-f0-9]{64}$" .Values.image) }}
+{{- fail "an enabled or retained Guardd installation requires its digest-pinned provider/installer image" }}
+{{- end }}
+{{- $clusterName := printf "%s-%s" $name (.Release.Namespace | sha256sum | trunc 12) -}}
+{{- $generation := printf "%v" .Release.Revision | sha256sum | trunc 12 -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-release
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+data: {}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-installation
+  annotations:
+    {{- include "guardd.retention" . | nindent 4 }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+data:
+  config.json: {{ dict
+    "releaseName" .Release.Name "releaseNamespace" .Release.Namespace
+    "revision" .Release.Revision "isInstall" .Release.IsInstall
+    "enabled" .Values.enabled "existingInstallationUID" .Values.existingInstallationUID
+    "image" .Values.image "imagePullPolicy" .Values.imagePullPolicy
+    "criSocketDirectory" .Values.criSocketDirectory "criSocketName" .Values.criSocketName
+    "stateDirectory" .Values.stateDirectory "controllerIdentity" .Values.controllerIdentity
+    "controllerMountDirectory" .Values.controllerMountDirectory
+    "nodeSelector" .Values.nodeSelector "imagePullSecrets" .Values.imagePullSecrets
+    | toJson | quote }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}-installer
+  annotations:
+    {{- include "guardd.retention" . | nindent 4 }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}-provider
+  annotations:
+    {{- include "guardd.retention" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}-installer
+  annotations:
+    {{- include "guardd.retention" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets", "services"]
+    verbs: ["get", "create", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}-installer
+  annotations:
+    {{- include "guardd.retention" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}-installer
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}-installer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $clusterName }}-installer
+  annotations:
+    {{- include "guardd.retention" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $clusterName }}-installer
+  annotations:
+    {{- include "guardd.retention" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}-installer
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $clusterName }}-installer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $clusterName }}-provider
+  annotations:
+    {{- include "guardd.retention" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $clusterName }}-provider
+  annotations:
+    {{- include "guardd.retention" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}-provider
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $clusterName }}-provider
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}-bootstrap-{{ $generation }}
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 180
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      {{- include "guardd.installerPod" (dict "root" . "stop" false) | nindent 6 }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}-renew
+  annotations:
+    {{- include "guardd.retention" . | nindent 4 }}
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 180
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 180
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          {{- include "guardd.installerPod" (dict "root" . "stop" false) | nindent 10 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}-stop-{{ $generation }}
+  annotations:
+    helm.sh/hook: pre-delete
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 180
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      {{- include "guardd.installerPod" (dict "root" . "stop" true) | nindent 6 }}
+{{- end }}

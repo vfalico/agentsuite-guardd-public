@@ -1,7 +1,9 @@
 include LICENSE NOTICE README.md THIRD_PARTY_NOTICES.md
+include .dockerignore
 recursive-include _backend *.py
 recursive-include docs *.md
 recursive-include config *.json
-recursive-include packaging *.service *.sh
+recursive-include packaging Dockerfile *.service *.sh *.md
+recursive-include charts *.yaml *.tpl *.md
 recursive-include gadget *.c *.yaml
 recursive-include adapter *.go go.mod

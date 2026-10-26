@@ -35,13 +35,28 @@ def main(argv=None):
     sub.add_parser("descriptor")
     sub.add_parser("serve")
     sub.add_parser("serve-enforcement")
+    sub.add_parser("serve-kubernetes-enforcement")
     sub.add_parser("serve-guest-enforcement")
+    installation = sub.add_parser("reconcile-kubernetes-installation")
+    installation.add_argument("--namespace", required=True)
+    installation.add_argument("--installation", required=True)
+    installation.add_argument("--disable-enrollment", action="store_true")
     c = sub.add_parser("compile")
     c.add_argument("policy")
     c.add_argument("--digest", required=True)
     c.add_argument("--target", required=True)
     a = p.parse_args(argv)
     try:
+        if a.command == "reconcile-kubernetes-installation":
+            from .kubernetes_install import reconcile
+            print(json.dumps(reconcile(
+                a.namespace, a.installation, disable_enrollment=a.disable_enrollment,
+            ), sort_keys=True))
+            return 0
+        if a.command == "serve-kubernetes-enforcement":
+            from .enforcement_server import serve_file
+            serve_file(a.config)
+            return 0
         if a.command == "serve-guest-enforcement":
             from .guest_stream import serve_file
             serve_file(a.config)

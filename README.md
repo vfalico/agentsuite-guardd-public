@@ -36,6 +36,22 @@ Runtime roots are `/etc/agentsuite-guardd`, `/run/agentsuite-guardd`, and `/var/
 
 ## Runtime-neutral enforcement service (experimental)
 
+The new Kubernetes/containerd adapter exposes the provider-neutral
+`orka.enforcement.v1` gRPC API over mTLS. It reuses this service's native
+filesystem/combined backends and durable store; it is not the historical signed
+provider protocol. See [configuration and lifecycle](docs/PROTOCOL.md#kubernetes-container-provider)
+and [the qualified container profile](docs/SECURITY.md#kubernetes-container-profile).
+The adapter supports complete filesystem-only `agentsuite.policy/v1` and
+[combined network/filesystem `agentsuite.policy/v3`](docs/CONTAINER_POLICY.md)
+requirements when their respective native objects are configured. Both combined
+capabilities share one physical target, immutable kernel object and lifecycle.
+Chart onboarding and Orka workload-admission wiring remain separate integrations.
+
+The experimental [Kubernetes provider image](packaging/kubernetes/README.md)
+packages the native filesystem/combined objects and runtime tools without embedding
+operator credentials or workload policy. Its build inputs and resulting
+private OCI artifact must be retained with qualification evidence.
+
 `agentsuite-guardd --config /absolute/private/network.json serve-enforcement`
 runs the `execution-enforcement/v1` Unix `SOCK_SEQPACKET` service implemented
 in `neutral_service.py`. This is the network lane consumed by the coupled
@@ -58,16 +74,27 @@ Without `"filesystemObject"`, filesystem assessment and activation refuse.
 This is not a combined filesystem/network policy or a network enforcement
 claim for filesystem-only workloads.
 
+The optional `"containerObject"` path enables the complete v3 policy through
+the same held-native lifecycle. Compile `gadget/container.bpf.c` using the
+selected kernel's BTF header. No configured object upgrades an existing policy
+or grants DNS, model, API or controller connectivity automatically.
+
 Filesystem activation requires the existing three transferred descriptors:
 exact cgroupfd, live pidfd, and netnsfd. The process must still be held by the
 runtime. Guardd resolves the **pidfd's receiver-local process**, validates the
 existing start/netns/cgroup identity, opens that process's `/proc/.../root`,
 and traverses policy paths relative to that held root. It never substitutes a
 same-named host path or uses the caller's numeric PID to locate the root.
-All policy components and descendants must exist, contain only ordinary
-directories/files, and have no symlinks. Traversal is limited to 8,192
+All policy components and descendants must exist. Explicit policy path
+components cannot be symlinks. Descendant symlinks are captured as protected
+inodes without following their destinations; regular files and directories
+are also supported. Traversal is limited to 8,192
 protected pathname identities, 128 components, and 4,096 pathname bytes;
-the serialized snapshot is capped at 64 KiB for bounded seqpacket readback.
+the serialized snapshot is capped at 512 KiB for bounded readback.
+The legacy seqpacket service additionally checks the complete encoded lookup
+reply against its actual socket send capacity before reporting activation.
+An untransportable snapshot refuses before installation where possible;
+oversized final kernel readback leaves cleanup-only state, never active proof.
 Resource exhaustion also refuses. Lower process FD limits can impose a
 smaller practical bound. Protected FDs remain held until retirement or daemon
 exit. The durable snapshot records receiver-local PID/start, root/mount
@@ -78,7 +105,9 @@ new inodes. The root process must remain alive in the bound cgroup for lookup.
 Each operation loads a private filesystem object: exactly three maps and all
 15 BPF-LSM programs/links. Both policy maps are frozen and completely dumped
 for exact readback; the kernel-produced denial ring buffer is not freezable.
-No other cgroup appears in the target map. Failures leave the durable operation
+No other cgroup appears in the target map. LSM checks also resolve the target
+among absolute hierarchy levels 0 through 63, so runtime-created child cgroups
+cannot bypass a qualified container target in those levels. Failures leave the durable operation
 cleanup-only with restrictions and identity FDs retained. Only the existing
 runtime-stopped/stable-empty retirement fence permits removal, including
 uncertain partial installs. Object-ID absence is independently checked after
@@ -149,6 +178,21 @@ Current tests include unit/protocol tests with explicit fake backends, plus
 separately captured task-owned native process and microVM boundary trials.
 A passing fake-backend test is not native enforcement acceptance. Run the
 complete Python tests and packaging checks separately from privileged trials.
+
+For an explicitly selected native Kubernetes lab, run the owned-container
+qualification as root with `GUARDD_FILESYSTEM_OBJECT` pointing at the BTF-built
+filesystem object and `GUARDD_KUBERNETES_CONFIG` at a private kubeconfig:
+
+```sh
+PYTHONPATH=src python3 -m pytest -q tests/test_native_kubernetes_provider.py
+```
+
+It creates a unique namespace and a small cached BusyBox container on the
+current host incarnation, proves initially allowed root writes become denied
+while other writes still succeed, exercises authenticated provider readback and
+restart recovery, then stops the container before retirement and removes its
+owned resources. It does not modify pre-existing Pods or qualify Orka/Kaimahi
+end-user workflows. No opt-in means this privileged test skips.
 
 The process boundary also checks the current sender at `socket_sendmsg`:
 otherwise sockets created in an ungoverned parent retain their original cgroup
