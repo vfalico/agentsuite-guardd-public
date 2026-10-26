@@ -9,7 +9,7 @@ import pytest
 
 from agentsuite_guardd.model import canonical, policy_digest
 from agentsuite_guardd.native_filesystem import HeldPaths, FilesystemNative
-from agentsuite_guardd.neutral_service import Service, requirement, validate_config
+from agentsuite_guardd.neutral_service import Service, requirement, validate_config, same_cgroup_object
 from agentsuite_guardd.policy import BackendPlan, OPERATIONS
 
 
@@ -52,7 +52,9 @@ def context(tmp_path):
     network, filesystem = RecordingNative(), RecordingNative()
     service = Service(tmp_path / "state", tmp_path / "pins", network, filesystem)
     with patch("agentsuite_guardd.neutral_service.held_target", return_value=os.getpid()), \
+         patch("agentsuite_guardd.neutral_service.boot_id", return_value="test"), \
          patch("agentsuite_guardd.neutral_service.target_identity", return_value=dict(boot="test", cgroup=target["cgroup"])), \
+         patch("agentsuite_guardd.neutral_service.cgroup_removed", return_value=False), \
          patch("agentsuite_guardd.neutral_service.task_ids", return_value=[os.getpid()]), \
          patch("agentsuite_guardd.neutral_service.read_events", return_value=dict(populated=0)):
         yield service, req, protected
@@ -131,6 +133,41 @@ def test_changed_path_blocks_retry_and_lookup_without_removing_restrictions(cont
             service.dispatch(dict(req, method=method), fds)
     assert service.row("fs")[2] == "ACTIVE"
     assert len(service.filesystem.installs) == 1
+
+
+def test_retiring_unknown_binding_tombstones_delayed_activation(context):
+    service, req, _ = context
+    with patch("agentsuite_guardd.neutral_service.task_ids", return_value=[]):
+        assert service.dispatch(dict(req, method="retire"), [1])["retired"]
+        assert service.dispatch(dict(req, method="retire"), [1])["retired"]
+    assert service.row(req["operation"])[2] == "RETIRED"
+    with pytest.raises(ValueError, match="cleanup-only"):
+        service.dispatch(req, [1, 2, 3])
+    assert not service.filesystem.installs
+
+
+def test_oversized_snapshot_refuses_before_installation(context):
+    service, req, _ = context
+    with pytest.raises(ValueError, match="transport reply capacity"):
+        service.dispatch(req, [1, 2, 3], reply_limit=256)
+    assert not service.filesystem.installs
+    assert service.row(req["operation"]) is None
+    assert not service.held_paths
+
+
+def test_complete_kernel_readback_must_fit_before_active(context):
+    service, req, _ = context
+    original = service.filesystem.verify
+    with patch.object(
+        service.filesystem, "verify",
+        side_effect=lambda *args: dict(original(*args), extra="x" * 16384),
+    ):
+        with pytest.raises(ValueError, match="transport reply capacity"):
+            service.dispatch(req, [1, 2, 3], reply_limit=4096)
+    assert len(service.filesystem.installs) == 1
+    assert service.row(req["operation"])[2] == "ACTIVATING"
+    with pytest.raises(ValueError, match="cleanup-only"):
+        service.dispatch(req, [1, 2, 3])
 
 
 def test_filesystem_uncertain_install_is_cleanup_only_and_needs_stable_empty(context):
@@ -280,3 +317,41 @@ def test_restart_cleanup_after_actor_death_uses_durably_bound_backend(context, u
     finally:
         recovered.close()
         service.__init__(state, pins, native, filesystem)
+
+
+@pytest.mark.parametrize("field", ["none", "boot", "dev", "ino", "cgroup_id", "mount_id", "missing"])
+def test_cross_mount_cgroup_identity_is_not_a_different_object(field):
+    expected = dict(boot="boot", cgroup=dict(dev=31, ino=7514292, cgroup_id=7514292, mount_id=3090))
+    actual = dict(boot="boot", cgroup=dict(expected["cgroup"], mount_id=37))
+    if field == "boot":
+        actual["boot"] = "different-boot"
+    elif field == "mount_id":
+        actual["cgroup"]["mount_id"] = 0
+    elif field == "missing":
+        del actual["cgroup"]["cgroup_id"]
+    elif field != "none":
+        actual["cgroup"][field] += 1
+    assert same_cgroup_object(actual, expected) is (field == "none")
+
+
+def test_filesystem_lookup_accepts_only_descriptor_mount_alias_not_changed_root(context):
+    service, req, protected = context
+    req["target"]["cgroup"] = dict(dev=31, ino=42, cgroup_id=42, mount_id=3090)
+    service.dispatch(req, [1, 2, 3])
+    actual = dict(boot="test", cgroup=dict(req["target"]["cgroup"], mount_id=37))
+    with patch("agentsuite_guardd.neutral_service.target_identity", return_value=actual):
+        assert service.dispatch(dict(req, method="lookup"), [1])["active"]
+        changed = json.loads(json.dumps(req))
+        changed["target"]["cgroup"]["mount_id"] = 37
+        with pytest.raises(ValueError, match="cannot change"):
+            service.dispatch(dict(changed, method="lookup"), [1])
+        with pytest.raises(ValueError, match="exact target changed"):
+            service.dispatch(dict(req, method="retire"), [1])
+        with patch("agentsuite_guardd.neutral_service.task_ids", return_value=[]):
+            with pytest.raises(ValueError, match="no longer belongs"):
+                service.dispatch(dict(req, method="lookup"), [1])
+        (protected / "canary").unlink()
+        (protected / "canary").write_text("replacement")
+        with pytest.raises(ValueError, match="identities changed"):
+            service.dispatch(dict(req, method="lookup"), [1])
+    assert service.row("fs")[2] == "ACTIVE"

@@ -24,7 +24,7 @@ class Native:
 @pytest.fixture
 def service(tmp_path):
  n=Native();s=Service(tmp_path/'state',tmp_path/'pins',n)
- with patch('agentsuite_guardd.neutral_service.held_target'),patch('agentsuite_guardd.neutral_service.target_identity',return_value=dict(boot='test-boot',cgroup=dict(dev=1,ino=1))),patch('agentsuite_guardd.neutral_service.task_ids',return_value=[]),patch('agentsuite_guardd.neutral_service.read_events',return_value=dict(populated=0)):
+ with patch('agentsuite_guardd.neutral_service.held_target'),patch('agentsuite_guardd.neutral_service.boot_id',return_value='test-boot'),patch('agentsuite_guardd.neutral_service.target_identity',return_value=dict(boot='test-boot',cgroup=dict(dev=1,ino=1))),patch('agentsuite_guardd.neutral_service.cgroup_removed',return_value=False),patch('agentsuite_guardd.neutral_service.task_ids',return_value=[]),patch('agentsuite_guardd.neutral_service.read_events',return_value=dict(populated=0)):
   yield s
  s.close()
 def test_exact_retry_never_installs_twice(service):

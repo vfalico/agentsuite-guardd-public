@@ -4,6 +4,24 @@ from base64 import b64decode
 import json, os, stat
 
 
+def load_root_json(path: str, maximum: int = 16384, *, allow_projected: bool = False) -> dict:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if not allow_projected:
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    with os.fdopen(fd) as stream:
+        metadata = os.fstat(stream.fileno())
+        if metadata.st_uid != 0 or metadata.st_mode & 0o022 or not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("root-owned non-writable regular configuration required")
+        raw = stream.read(maximum + 1)
+        if len(raw) > maximum:
+            raise ValueError("configuration too large")
+    value = json.loads(raw)
+    if type(value) is not dict:
+        raise ValueError("configuration must be a JSON object")
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     listen: str

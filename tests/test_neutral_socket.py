@@ -3,7 +3,26 @@ import os
 import socket
 from pathlib import Path
 import pytest
-from agentsuite_guardd.neutral_service import bind_owned_socket
+from agentsuite_guardd.neutral_service import bind_owned_socket, checked_reply, seqpacket_reply_limit
+
+
+def test_large_evidence_uses_verified_real_seqpacket_capacity():
+    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    with sender, receiver:
+        sender.settimeout(2)
+        receiver.settimeout(2)
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        result = {"readback": "x" * (300 * 1024)}
+        limit = seqpacket_reply_limit(sender)
+        if limit < 301 * 1024:
+            with pytest.raises(ValueError, match="transport reply capacity"):
+                checked_reply(result, limit)
+        else:
+            reply = checked_reply(result, limit)
+            assert sender.send(reply) == len(reply)
+            assert receiver.recv(len(reply) + 1) == reply
+        with pytest.raises(ValueError, match="transport reply capacity"):
+            checked_reply({"readback": "x" * limit}, limit)
 
 @pytest.fixture
 def address(tmp_path):
