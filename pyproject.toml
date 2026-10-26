@@ -12,7 +12,10 @@ requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
 authors = [{name="Veaceslav Falico", email="vfalico@gmail.com"}]
-dependencies = ["cryptography>=46,<47"]
+dependencies = ["cryptography>=46,<47", "grpcio>=1.74,<2", "protobuf>=6.31.1,<7"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "grpcio-tools==1.74.0"]
 
 [project.scripts]
 agentsuite-guardd = "agentsuite_guardd.cli:main"
