@@ -9,6 +9,7 @@ import pytest
 
 from agentsuite_guardd.config import load_root_json
 from agentsuite_guardd.kubernetes_api import Conflict, KubernetesAPI, NoRedirect
+from agentsuite_guardd.enforcement_server import node_uid
 
 
 def client(tmp_path):
@@ -84,3 +85,20 @@ def test_projected_configuration_requires_explicit_lane_and_safe_opened_inode(tm
         load_root_json(fifo, allow_projected=True)
 
 
+def test_provider_node_identity_is_independently_verified(monkeypatch):
+    class API:
+        value = {"metadata": {"name": "worker", "uid": "actual-node"}}
+
+        def request(self, method, path, **options):
+            assert method == "GET"
+            assert path == "/api/v1/nodes/worker"
+            return self.value
+
+    monkeypatch.setattr("agentsuite_guardd.enforcement_server.KubernetesAPI", API)
+    assert node_uid("worker") == "actual-node"
+    API.value = {"metadata": {"name": "another-node", "uid": "actual-node"}}
+    with pytest.raises(ValueError):
+        node_uid("worker")
+    API.value = None
+    with pytest.raises(ValueError):
+        node_uid("worker")

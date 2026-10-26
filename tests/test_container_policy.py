@@ -14,6 +14,7 @@ from agentsuite_guardd.native_filesystem import FilesystemNative
 from agentsuite_guardd.native_network import Native
 from agentsuite_guardd.neutral_service import requirement
 from test_neutral_filesystem import context
+from test_kubernetes_provider import provider_context
 
 
 CAPABILITIES = ["filesystem/deny-write/v1", "network/egress-allow/v1"]
@@ -143,6 +144,18 @@ def test_no_filesystem_only_fallback_for_complete_requirement(context):
     assert not service.filesystem.installs
 
 
+def test_kubernetes_adapter_preserves_complete_combined_requirement(provider_context):
+    provider, request, backend, _ = provider_context
+    provider.service.container = backend
+    old = json.loads(request.requirement.policy)
+    request.requirement.format = FORMAT
+    request.requirement.policy = canonical(policy(old["denyWritePaths"]))
+    request.requirement.required_capabilities[:] = CAPABILITIES
+    result = provider.ensure(request).enforced
+    assert list(result.enforced_capabilities) == CAPABILITIES
+    assert json.loads(result.evidence)["filesystem"]["network"]
+    assert provider.ensure(request).enforced.binding_id == result.binding_id
+    assert len(backend.installs) == 1
 
 
 def readback(native):
